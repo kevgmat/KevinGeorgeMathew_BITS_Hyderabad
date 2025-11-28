@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+google-generativeai
+pdf2image
+scipy
+numpy
+opencv-python-headless
