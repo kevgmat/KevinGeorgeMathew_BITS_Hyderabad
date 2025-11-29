@@ -1,10 +1,8 @@
 fastapi
 uvicorn
-pydantic
+python-multipart
 google-generativeai
-requests
-pillow
-opencv-python
-numpy
-scipy
 pdf2image
+scipy
+numpy
+opencv-python-headless
