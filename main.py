@@ -57,6 +57,33 @@ def deskew_image_logic(image):
     M = cv2.getRotationMatrix2D(center, best_angle, 1.0)
     return cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
+def apply_clahe(cv_img, clip_limit=1.0, tile_size=(16, 16)):
+    """Applies Contrast Limited Adaptive Histogram Equalization with optimized defaults (1.0, 16x16)."""
+    if cv_img is None:
+        return None
+
+    try:
+        # Determine if it's a color or grayscale image
+        if len(cv_img.shape) == 3:
+            lab = cv2.cvtColor(cv_img, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            
+            # Use optimized parameters
+            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
+            cl = clahe.apply(l)
+            
+            limg = cv2.merge((cl, a, b))
+            final = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+        else:
+            # Grayscale image
+            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
+            final = clahe.apply(cv_img)
+            
+        return final
+    except Exception:
+        # If any CV error occurs, return the original image
+        return cv_img   
+
 def apply_signal_zebra(cv_img):
     img = deskew_image_logic(cv_img)
     H, W = img.shape[:2]
@@ -113,21 +140,25 @@ def normalize_page_type(raw_type):
     elif "final" in text or "summary" in text or "receipt" in text or "net payable" in text:
         return "Final Bill"
     else:
-        # Default for "Invoice", "Bill", "Breakdown" etc.
+        # Default value
         return "Bill Detail"
 
 async def process_single_page(pil_image, page_number):
-    # 1. Vision Processing (Try/Except to prevent CV crashes)
+    # 1. Vision Processing 
     try:
         cv_img = pil_to_cv2(pil_image)
-        striped_cv = apply_signal_zebra(cv_img)
+
+        enhanced_cv = apply_clahe(cv_img)
+        striped_cv = apply_signal_zebra(enhanced_cv)
         final_pil = optimize_image(cv2_to_pil(striped_cv))
+
     except Exception as e:
         print(f"CV Error on page {page_number}: {e}")
         final_pil = optimize_image(pil_image)
 
     # 2. Gemini Processing
     prompt = """
+    The image has been digitally enhanced for maximum contrast and row separation.
     Analyze this medical bill page and extract data in JSON format.
     
     TASK 1: CLASSIFY PAGE TYPE
@@ -143,26 +174,15 @@ async def process_single_page(pil_image, page_number):
     - "item_rate": (float) Unit price/rate.
     - "item_amount": (float) Net amount for that line.
     - make sure not to extract "subtotal", "tota" or things like "amount due" as line items
-
-    TASK 3: EXTRACT DOCUMENT TOTAL  (Global)
-    - Look for the "Net Payable", "Grand Total", or "Total Amount" at the bottom.
-    - If this page does NOT have the final total, set this to 0.
     
     OUTPUT JSON STRUCTURE:
     {
       "page_type": "String (one of the 3 allowed types)",
       "items": [ ... ],
-      "financial_summary": {
-         "tax_amount": float,
-         "discount_amount": float,
-         "round_off": float,
-         "printed_total_amount": float
-      }
     }
     """
     
     try:
-        # This is where the error likely happens
         response = await asyncio.to_thread(model.generate_content, [prompt, final_pil])
         
         # Verify response validity
@@ -199,13 +219,23 @@ async def process_single_page(pil_image, page_number):
         # Format Output
         clean_items = []
         for item in data.get("items", []) or []:
+            try:
+                item_amount_clean = float(item.get("item_amount", 0.0))
+            except (ValueError, TypeError):
+                item_amount_clean = 0.0 # Safety net for bad string inputs
+        
+            try:
+                item_rate_clean = float(item.get("item_rate", 0.0))
+            except (ValueError, TypeError):
+                item_rate_clean = 0.0
+
             clean_items.append({
                 "item_name": item.get("item_name"),
-                "item_amount": item.get("item_amount"),
-                "item_rate": item.get("item_rate", 0.0),
-                "item_quantity": item.get("item_quantity", 0.0)                
+                "item_amount": item_amount_clean,
+                "item_rate": item_rate_clean,
+                "item_quantity": float(item.get("item_quantity", 0.0))                
             })
-        fin = data.get("financial_summary", {})
+
         usage = response.usage_metadata
         return {
             "tokens": {
@@ -215,12 +245,6 @@ async def process_single_page(pil_image, page_number):
             },
             "page_no": str(page_number),
             "page_type": strict_page_type,
-            "printed_total_amount": fin.get("printed_total_amount", 0.0),
-            "financial_summary": {
-                "tax": fin.get("tax_amount", 0.0),
-                "discount": fin.get("discount_amount", 0.0),
-                "round_off": fin.get("round_off", 0.0)
-            },
             "bill_items": clean_items,
             "error": None
         }
@@ -233,32 +257,26 @@ async def process_single_page(pil_image, page_number):
             "page_no": str(page_number),
             "page_type": "Error",
             "bill_items": [],
-            "printed_total_amount": 0.0,
-            "financial_summary": {"tax":0,"discount":0,"round_off":0},
-            "error": error_msg  # <--- This will show in your JSON
+            "error": error_msg  
         }
 
 # --- 4. ENDPOINT ---
 @app.post("/extract-bill-data")
 async def extract_bill_data(request: BillRequest):
-# async def extract_bill_data(file: UploadFile = File(...)):
     start_time = time.time()
     try:
         # 1. Download
         print(f"Downloading: {request.document}")
         # Add User-Agent to avoid 403 Forbidden from some servers
         headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(request.document, headers=headers, timeout=15)
-        
+
+        response = await asyncio.to_thread(requests.get, request.document, headers=headers, timeout=15)
+
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail=f"Download failed: Status {response.status_code}")
             
         file_content = response.content
         url_lower = request.document.lower().split('?')[0] # Ignore query params
-        
-        # print(f"Receiving file: {file.filename}")
-        # file_content = await file.read()
-        # filename_lower = file.filename.lower()
 
         # 2. Process
         pagewise_results = []
@@ -283,7 +301,6 @@ async def extract_bill_data(request: BillRequest):
             }, status_code=500)
 
         final_pages = []
-        # global_line_item_sum = 0.0
         total_items_count = 0
 
         total_tokens = sum(p["tokens"]["total"] for p in pagewise_results)
@@ -295,7 +312,6 @@ async def extract_bill_data(request: BillRequest):
             
             # --- STRICT SCHEMA ENFORCEMENT ---
             # Only include the 3 specific fields required by the problem statement.
-            # Do NOT pass "tokens" or "financial_summary" here.
             final_pages.append({
                 "page_no": p["page_no"],
                 "page_type": p["page_type"],
@@ -312,7 +328,6 @@ async def extract_bill_data(request: BillRequest):
             "data": {
                 "pagewise_line_items": final_pages,
                 "total_item_count": total_items_count
-                # "reconciled_amount": round(calculated_total_with_adj, 2)
             }
         }
 
