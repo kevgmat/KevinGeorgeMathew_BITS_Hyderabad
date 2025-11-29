@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi import File, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -7,6 +7,9 @@ import PIL.Image
 import io
 import json
 import time
+import logging
+from logging import StreamHandler, Formatter
+from typing import Callable
 import os
 import asyncio
 import requests
@@ -23,9 +26,24 @@ os.environ["GLOG_minloglevel"] = "2"
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     # Fallback for local testing if env var is missing
-    print(" Warning: GEMINI_API_KEY not found in environment.")
+    logger = logging.getLogger("invoice_extractor")
+    logger.warning("GEMINI_API_KEY not set in environment — running without a configured API key may fail.")
 
 genai.configure(api_key=api_key, transport="rest")
+
+# --- Logging configuration ---
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+logger = logging.getLogger("invoice_extractor")
+logger.setLevel(LOG_LEVEL)
+handler = StreamHandler()
+handler.setLevel(LOG_LEVEL)
+handler.setFormatter(Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+if not logger.handlers:
+    logger.addHandler(handler)
+
+# bridge uvicorn logs to our logger for convenience
+logging.getLogger("uvicorn.access").handlers = [handler]
+logging.getLogger("uvicorn.error").handlers = [handler]
 
 model = genai.GenerativeModel(
     'gemini-2.5-flash',
@@ -33,6 +51,23 @@ model = genai.GenerativeModel(
 )
 
 app = FastAPI(title="BFHL Datathon Invoice Extractor")
+
+
+# --- Request logging middleware ---
+@app.middleware("http")
+async def log_requests(request: Request, call_next: Callable):
+    """Log each incoming HTTP request and record duration and response status."""
+    start = time.time()
+    client = request.client.host if request.client else "-"
+    logger.debug(f"Request start: {request.method} {request.url} from {client}")
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        logger.exception(f"Unhandled exception while handling request {request.method} {request.url}")
+        raise
+    duration = (time.time() - start) * 1000.0
+    logger.info(f"Request finished: {request.method} {request.url} status={response.status_code} time_ms={duration:.1f}")
+    return response
 
 # Input Schema
 class BillRequest(BaseModel):
@@ -144,7 +179,9 @@ def normalize_page_type(raw_type):
         return "Bill Detail"
 
 async def process_single_page(pil_image, page_number):
-    # 1. Vision Processing 
+    # 1. Vision Processing
+    logger.info(f"Page {page_number}: starting vision processing")
+    cv_start = time.time()
     try:
         cv_img = pil_to_cv2(pil_image)
 
@@ -152,8 +189,10 @@ async def process_single_page(pil_image, page_number):
         striped_cv = apply_signal_zebra(enhanced_cv)
         final_pil = optimize_image(cv2_to_pil(striped_cv))
 
-    except Exception as e:
-        print(f"CV Error on page {page_number}: {e}")
+        logger.debug(f"Page {page_number}: vision processing complete (t={1000*(time.time()-cv_start):.1f}ms)")
+
+    except Exception:
+        logger.exception(f"Page {page_number}: CV processing failed; falling back to original image")
         final_pil = optimize_image(pil_image)
 
     # 2. Gemini Processing
@@ -183,7 +222,10 @@ async def process_single_page(pil_image, page_number):
     """
     
     try:
+        model_start = time.time()
+        logger.info(f"Page {page_number}: calling model.generate_content")
         response = await asyncio.to_thread(model.generate_content, [prompt, final_pil])
+        logger.info(f"Page {page_number}: model returned (t={1000*(time.time()-model_start):.0f}ms)")
         
         # Verify response validity
         if not response.text:
@@ -209,7 +251,8 @@ async def process_single_page(pil_image, page_number):
             try:
                 data = ast.literal_eval(raw_text)
             except:
-                raise ValueError(f"Failed to parse JSON. Raw output: {raw_text[:100]}...")
+                logger.error(f"Page {page_number}: failed to parse JSON from model. snippet={raw_text[:200]!r}")
+                raise ValueError(f"Failed to parse JSON. Raw output: {raw_text[:200]}...")
             
         # data = json.loads(response.text)
         
@@ -252,7 +295,7 @@ async def process_single_page(pil_image, page_number):
     except Exception as e:
         # --- CRITICAL: Return the actual error message ---
         error_msg = str(e)
-        print(f"API Error on page {page_number}: {error_msg}")
+        logger.exception(f"API error while processing page {page_number}: {error_msg}")
         return {
             "page_no": str(page_number),
             "page_type": "Error",
@@ -266,27 +309,31 @@ async def extract_bill_data(request: BillRequest):
     start_time = time.time()
     try:
         # 1. Download
-        print(f"Downloading: {request.document}")
+        logger.info(f"Download requested: {request.document}")
         # Add User-Agent to avoid 403 Forbidden from some servers
         headers = {'User-Agent': 'Mozilla/5.0'}
 
         response = await asyncio.to_thread(requests.get, request.document, headers=headers, timeout=15)
 
         if response.status_code != 200:
+            logger.warning(f"Download failed: {request.document} returned status {response.status_code}")
             raise HTTPException(status_code=400, detail=f"Download failed: Status {response.status_code}")
             
         file_content = response.content
+        logger.info(f"Download completed: {len(file_content)} bytes (status {response.status_code})")
         url_lower = request.document.lower().split('?')[0] # Ignore query params
 
         # 2. Process
         pagewise_results = []
         if url_lower.endswith(".pdf") or file_content[:4] == b'%PDF':
             images = convert_from_bytes(file_content)
+            logger.info(f"Input recognized as PDF — {len(images)} pages extracted")
             tasks = [process_single_page(img, i + 1) for i, img in enumerate(images)]
             pagewise_results = await asyncio.gather(*tasks)
         else:
             try:
                 img = PIL.Image.open(io.BytesIO(file_content))
+                logger.info("Input recognized as Image file — processing single page")
                 pagewise_results = [await process_single_page(img, 1)]
             except IOError:
                 raise HTTPException(status_code=400, detail="File is not a valid Image or PDF")
@@ -295,6 +342,7 @@ async def extract_bill_data(request: BillRequest):
         errors = [p["error"] for p in pagewise_results if p.get("error")]
         if errors:
             # If errors exist, return them in the message so you can debug
+            logger.error(f"Errors while processing pages: {errors}")
             return JSONResponse(content={
                 "is_success": False,
                 "message": f"Processing Errors: {'; '.join(errors)}"
@@ -318,6 +366,9 @@ async def extract_bill_data(request: BillRequest):
                 "bill_items": p["bill_items"]
             })
 
+        total_time = time.time() - start_time
+        logger.info(f"Completed processing request: pages={len(pagewise_results)} total_items={total_items_count} total_time_s={total_time:.2f} tokens={total_tokens}")
+
         return {
             "is_success": True,
             "token_usage": {
@@ -332,6 +383,7 @@ async def extract_bill_data(request: BillRequest):
         }
 
     except Exception as e:
+        logger.exception("Unhandled error in extract_bill_data")
         return JSONResponse(content={
             "is_success": False,
             "message": str(e)
@@ -339,4 +391,5 @@ async def extract_bill_data(request: BillRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use configured log level for uvicorn too
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level=LOG_LEVEL.lower() if isinstance(LOG_LEVEL, str) else "info")
