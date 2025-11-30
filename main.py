@@ -260,23 +260,38 @@ async def process_single_page(pil_image, page_number):
         strict_page_type = normalize_page_type(raw_type)
 
         # Format Output
+        
         clean_items = []
         for item in data.get("items", []) or []:
+            # 1. Safe Amount Extraction
             try:
                 item_amount_clean = float(item.get("item_amount", 0.0))
             except (ValueError, TypeError):
-                item_amount_clean = 0.0 # Safety net for bad string inputs
+                item_amount_clean = 0.0 
         
+            # 2. Safe Rate Extraction
             try:
                 item_rate_clean = float(item.get("item_rate", 0.0))
             except (ValueError, TypeError):
                 item_rate_clean = 0.0
 
+            # 3. Safe Quantity Extraction (UPDATED REQUIREMENT: Default to 0.0)
+            try:
+                raw_qty = item.get("item_quantity", 0.0)
+                
+                # Check for None or empty string
+                if raw_qty is None or str(raw_qty).strip() == "":
+                    item_quantity_clean = 0.0 
+                else:
+                    item_quantity_clean = float(raw_qty)
+            except (ValueError, TypeError):
+                item_quantity_clean = 0.0 # Default to 0.0 on error
+
             clean_items.append({
                 "item_name": item.get("item_name"),
                 "item_amount": item_amount_clean,
                 "item_rate": item_rate_clean,
-                "item_quantity": float(item.get("item_quantity", 0.0))                
+                "item_quantity": item_quantity_clean 
             })
 
         usage = response.usage_metadata
